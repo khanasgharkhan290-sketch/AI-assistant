@@ -25,7 +25,17 @@ import streamlit as st
 MAX_FILE_MB = 5
 MAX_CHARS_TO_AI = 15000          # keeps prompts small & cheap
 MIN_CHARS_FOR_TEXT = 200         # below this we assume a scanned/image PDF
-DEFAULT_MODEL = "gemini-2.5-flash"
+# "gemini-flash-latest" is Google's alias that always points to the newest Flash model,
+# so the app keeps working when individual model versions are retired.
+DEFAULT_MODEL = "gemini-flash-latest"
+# Tried in order (after the selected model) if a model returns 404 / "no longer available".
+FALLBACK_MODELS = [
+    "gemini-flash-latest",
+    "gemini-3.6-flash",
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-2.5-flash",
+]
 RULE_WEIGHT = 0.4                # final = 40% rule-based + 60% AI
 AI_WEIGHT = 0.6
 
@@ -353,46 +363,69 @@ def parse_ai_json(raw: str) -> Dict[str, Any]:
     }
 
 
-def call_gemini(api_key: str, model: str, prompt: str, retries: int = 3) -> str:
-    """Call Gemini with JSON output + simple retry for transient errors."""
+def _is_model_missing(msg: str) -> bool:
+    return "404" in msg or "not_found" in msg or "not found" in msg or "no longer available" in msg
+
+
+def call_gemini(api_key: str, model: str, prompt: str, retries: int = 3) -> tuple:
+    """
+    Call Gemini with JSON output.
+    - Retries transient errors (429/5xx) with backoff.
+    - If a model is missing/retired (404), automatically tries the fallback models.
+    Returns (response_text, model_actually_used).
+    """
     from google import genai
     from google.genai import types
 
     client = genai.Client(api_key=api_key)
+    # Note: temperature is intentionally left at its default - Google recommends this for Gemini 3 models.
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_INSTRUCTION,
-        temperature=0.2,
         response_mime_type="application/json",
     )
 
+    candidates = [model] + [m for m in FALLBACK_MODELS if m != model]
+    missing: List[str] = []
     last_exc: Exception = Exception("unknown error")
-    for attempt in range(retries):
-        try:
-            response = client.models.generate_content(
-                model=model, contents=prompt, config=config
-            )
-            text = getattr(response, "text", None)
-            if not text:
-                raise AnalysisError(
-                    "Gemini returned no text (the response may have been blocked). Try again."
+
+    for candidate in candidates:
+        for attempt in range(retries):
+            try:
+                response = client.models.generate_content(
+                    model=candidate, contents=prompt, config=config
                 )
-            return text
-        except AnalysisError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            msg = str(exc).lower()
-            if any(s in msg for s in ("api key", "api_key", "permission", "401", "403")):
-                raise AnalysisError("Invalid or unauthorized Gemini API key.")
-            if "404" in msg or "not found" in msg:
-                raise AnalysisError(
-                    f"Model '{model}' was not found. Change the model name in the sidebar."
-                )
-            retryable = any(s in msg for s in ("429", "500", "503", "overloaded", "unavailable", "timeout"))
-            if retryable and attempt < retries - 1:
-                time.sleep(2 ** attempt * 2)
-                continue
-            break
+                text = getattr(response, "text", None)
+                if not text:
+                    raise AnalysisError(
+                        "Gemini returned no text (the response may have been blocked). Try again."
+                    )
+                return text, candidate
+            except AnalysisError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                msg = str(exc).lower()
+                if _is_model_missing(msg):
+                    missing.append(candidate)
+                    break  # go to next candidate model
+                if any(s in msg for s in ("api key not valid", "api_key_invalid", "permission_denied",
+                                          "unauthenticated", "401", "403")):
+                    raise AnalysisError(
+                        "Invalid or unauthorized Gemini API key (or the key has no access to this model)."
+                    )
+                retryable = any(s in msg for s in ("429", "500", "503", "overloaded", "unavailable", "timeout"))
+                if retryable and attempt < retries - 1:
+                    time.sleep(2 ** attempt * 2)
+                    continue
+                raise AnalysisError(f"Gemini request failed: {exc}")
+
+    if missing and len(missing) == len(candidates):
+        raise AnalysisError(
+            "None of these models are available for your API key: "
+            + ", ".join(missing)
+            + ". Check https://ai.google.dev/gemini-api/docs/models for the current Flash model name "
+            "and enter it in the sidebar."
+        )
     raise AnalysisError(f"Gemini request failed: {last_exc}")
 
 
@@ -417,7 +450,8 @@ def run_analysis(filename: str, data: bytes, jd: str, api_key: str, model: str) 
 
     text = extract_text(filename, data)
     rules = rule_based_score(text)
-    ai = parse_ai_json(call_gemini(api_key, model, build_prompt(text, jd)))
+    raw, used_model = call_gemini(api_key, model, build_prompt(text, jd))
+    ai = parse_ai_json(raw)
 
     final = int(round(RULE_WEIGHT * rules["score"] + AI_WEIGHT * ai["ai_score"]))
     return {
@@ -426,6 +460,8 @@ def run_analysis(filename: str, data: bytes, jd: str, api_key: str, model: str) 
         "rules": rules,
         "ai": ai,
         "has_jd": bool(jd.strip()),
+        "model": used_model,
+        "requested_model": model,
         "text": text,
     }
 
@@ -438,6 +474,7 @@ def build_report(result: Dict[str, Any]) -> str:
         f"- Rule-based score: {rules['score']}/100",
         f"- AI score: {ai['ai_score']}/100",
         f"- Detected role: {ai['detected_role']}",
+        f"- Model used: {result.get('model', '-')}",
         "",
         "## Summary",
         ai["summary"],
@@ -484,6 +521,12 @@ def render_result(result: Dict[str, Any]) -> None:
     st.markdown(f"### {score_label(final)} - targeting: **{ai['detected_role']}**")
     if ai["summary"]:
         st.info(ai["summary"])
+    if result.get("model") and result["model"] != result.get("requested_model"):
+        st.warning(
+            f"Model '{result['requested_model']}' was unavailable, so '{result['model']}' was used instead. "
+            "You can set this model in the sidebar to skip the fallback."
+        )
+    st.caption(f"Model used: {result.get('model', '-')}")
 
     tab_imp, tab_kw, tab_rw, tab_chk, tab_txt = st.tabs(
         ["🛠 Improvements", "🔑 Keywords", "✍️ Rewrites", "✅ Checks", "📄 Parsed text"]
@@ -565,7 +608,8 @@ def main() -> None:
         model = st.text_input(
             "Gemini model",
             value=get_secret("GEMINI_MODEL") or os.getenv("GEMINI_MODEL", DEFAULT_MODEL),
-            help="Any Gemini Flash model name, e.g. gemini-2.5-flash",
+            help="Default 'gemini-flash-latest' always points to the newest Flash model. "
+                 "You can also enter e.g. gemini-3.6-flash.",
         ).strip() or DEFAULT_MODEL
         st.caption("Your resume is sent to Google's Gemini API for analysis. Nothing is stored by this app.")
 
