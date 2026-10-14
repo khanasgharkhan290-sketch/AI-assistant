@@ -1,4 +1,3 @@
-# AI-assistant
 # 📄 AI Resume ATS Analyzer
 
 Upload a resume (PDF, DOCX or TXT) and get an **ATS score**, keyword gaps, prioritized
@@ -44,7 +43,7 @@ Create `.streamlit/secrets.toml` (never commit this file):
 
 ```toml
 GEMINI_API_KEY = "your-key-here"
-# GEMINI_MODEL = "gemini-2.5-flash"   # optional override
+# GEMINI_MODEL = "gemini-3.6-flash"   # optional override
 ```
 
 ## Push to GitHub
@@ -88,15 +87,19 @@ To update the app later, just `git push`; Streamlit redeploys automatically.
 | Setting | Where | Default |
 |---------|-------|---------|
 | `GEMINI_API_KEY` | secrets, env var or sidebar | none (required) |
-| `GEMINI_MODEL` | secrets, env var or sidebar | `gemini-2.5-flash` |
+| `GEMINI_MODEL` | secrets, env var or sidebar | `gemini-flash-latest` |
 
-If Google retires a model name you will see a "model not found" error. Just type the current
-Flash model name in the sidebar (see https://ai.google.dev/gemini-api/docs/models).
+The default `gemini-flash-latest` is Google's alias that always points to the newest Flash model.
+If a model returns 404 / "no longer available" (Google retires models regularly), the app automatically
+tries `gemini-3.6-flash`, `gemini-3.8-flash`, `gemini-3.5-flash-lite` and `gemini-2.5-flash` in turn and
+shows which model was used. To change the list, edit `FALLBACK_MODELS` at the top of `app.py`.
+Current model names: https://ai.google.dev/gemini-api/docs/models
 
 ## Troubleshooting
 
 - **"Almost no text could be extracted"**: the PDF is a scanned image. Export a text-based PDF or DOCX.
 - **"Invalid or unauthorized API key"**: check the key and that the Gemini API is enabled for it.
+- **"None of these models are available"**: enter a current Flash model name from the docs link above in the sidebar.
 - **Rate limit (429)**: the app retries automatically; if it persists, wait a minute.
 
 ## Privacy
